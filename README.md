@@ -18,8 +18,6 @@
 
 ---
 
-A single
-
 A single `futron-scrape <url>` walks 9 tiers in priority order and returns clean markdown (or JSON, or raw HTML) the moment one tier produces useful content. Works on:
 
 - 🟢 **Public APIs the open web already exposes** — Reddit, Hacker News, Bluesky, Mastodon, GitHub, Stack Exchange, Wikipedia, npm, PyPI, Substack
@@ -43,7 +41,7 @@ When every OSS path is exhausted (real auth wall + no logged-in browser availabl
 ## Install
 
 ```bash
-git clone https://github.com/<your-org>/futron-scrape.git
+git clone https://github.com/FutronPrime/futron-scrape.git
 cd futron-scrape
 ./install.sh
 ```

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # futron-scrape — Universal free / OSS web scraping cascade.
-# https://github.com/<your-org>/futron-scrape  (public sanitized release)
+# https://github.com/FutronPrime/futron-scrape  (public sanitized release)
 #
 # Replaces Firecrawl (paid) + WebFetch (billed) with a 9-tier strategy that
 # stops at the first tier returning useful content.
