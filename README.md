@@ -1,6 +1,24 @@
-# futron-scrape
+<p align="center">
+  <img src="docs/logo.png" alt="futron-scrape logo" width="180">
+</p>
 
-Free, OSS-only web scraping cascade — drop-in replacement for paid Firecrawl / billed `WebFetch` in your Claude Code, Codex, or any agent harness.
+<h1 align="center">futron-scrape</h1>
+
+<p align="center">
+  <b>Universal free OSS web-scraping cascade.</b><br>
+  Drop-in replacement for paid Firecrawl / billed <code>WebFetch</code> in any Claude Code, Codex, or agent harness.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square"></a>
+  <img alt="9-tier cascade" src="https://img.shields.io/badge/cascade-9_tiers-8b5cf6?style=flat-square">
+  <img alt="No keys required" src="https://img.shields.io/badge/keys-optional-84cc16?style=flat-square">
+  <a href="docs/DESIGN.md"><img alt="DESIGN.md" src="https://img.shields.io/badge/DESIGN.md-included-14b8a6?style=flat-square"></a>
+</p>
+
+---
+
+A single
 
 A single `futron-scrape <url>` walks 9 tiers in priority order and returns clean markdown (or JSON, or raw HTML) the moment one tier produces useful content. Works on:
 
