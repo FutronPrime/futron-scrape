@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# futron-bookmark-watcher — Continuous monitor of DJ's curated X bookmark folder.
+# (set -e is intentionally NOT used inside scan_once — bookmark processing is best-effort.)
+#
+# Source: ${FUTRON_BOOKMARK_URL:?set FUTRON_BOOKMARK_URL to your Dewey public folder URL}
+# (Dewey's public mirror exposes the most-recent ~20 bookmarks without auth.
+#  Polling daily catches new finds before they fall off the public window.
+#  Once XMCP OAuth is complete, switch to live X API for full backfill.)
+#
+# What it does on each run:
+#   1. Scrape Dewey folder via futron-scrape (free path: jina reader)
+#   2. Extract unique tweet URLs + per-tweet body text
+#   3. Diff against state/seen.json — process only NEW items
+#   4. For each new item:
+#        - Detect GitHub repos, npm packages, pip packages, install commands
+#        - Classify (cli-tool / mcp / skill / repo / article / model / other) via futron-llm-cascade
+#        - Save full record to memory/x-bookmark-finds/<date>/<handle>-<id>.md
+#        - Append to running index memory/x-bookmark-finds/INDEX.md
+#   5. Optional: --install-safe pulls obvious safe installs (skills only by default)
+#   6. Log to /tmp/futron-bookmark-watcher.log
+#   7. Optional: --notify pings Telegram when new items arrive
+#
+# Usage:
+#   futron-bookmark-watcher                  # one-shot scan
+#   futron-bookmark-watcher --install-safe   # also run safe auto-installs (Claude Skills)
+#   futron-bookmark-watcher --notify         # Telegram-ping on finds
+#   futron-bookmark-watcher --reset          # clear state (forces re-scan of all visible)
+#   futron-bookmark-watcher --list           # list everything seen so far
+#   futron-bookmark-watcher --watch INTERVAL # continuous loop (e.g. 3600 = hourly)
+#
+# Env:
+#   FUTRON_BOOKMARK_URL   override source URL (default: clawdbot folder)
+#   FUTRON_BOOKMARK_DIR   memory output dir (default: ~/.config/futron-scrape/x-bookmark-finds)
+#   FUTRON_BOOKMARK_STATE state path (default: ~/.openclaw/state/bookmark-watcher)
+#
+set -uo pipefail
+
+URL="${FUTRON_BOOKMARK_URL:-${FUTRON_BOOKMARK_URL:?set FUTRON_BOOKMARK_URL to your Dewey public folder URL}}"
+STATE_DIR="${FUTRON_BOOKMARK_STATE:-${FUTRON_BOOKMARK_STATE:-$HOME/.config/futron-scrape/bookmark-watcher}}"
+MEM_DIR="${FUTRON_BOOKMARK_DIR:-${FUTRON_BOOKMARK_DIR:-$HOME/.config/futron-scrape/bookmarks}}"
+LOG="/tmp/futron-bookmark-watcher.log"
+INSTALL_SAFE=0
+NOTIFY=0
+WATCH=0
+LIST=0
+RESET=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --install-safe) INSTALL_SAFE=1; shift ;;
+    --notify) NOTIFY=1; shift ;;
+    --watch) WATCH="${2:-3600}"; shift 2 ;;
+    --list) LIST=1; shift ;;
+    --reset) RESET=1; shift ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+mkdir -p "$STATE_DIR" "$MEM_DIR"
+SEEN="$STATE_DIR/seen.json"
+[[ -f "$SEEN" ]] || echo '{}' > "$SEEN"
+
+log()  { printf '[%s] %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$*" >> "$LOG"; }
+
+if [[ "$RESET" == 1 ]]; then echo '{}' > "$SEEN"; log "state reset"; echo "state reset."; exit 0; fi
+
+if [[ "$LIST" == 1 ]]; then
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k, v in sorted(d.items(), key=lambda x: x[1].get("seen","")):
+  print(f"{v.get(\"seen\",\"?\"):20s} {v.get(\"handle\",\"?\"):20s} {k}")
+print(f"\\nTotal: {len(d)} bookmarks tracked")
+' "$SEEN"
+  exit 0
+fi
+
+scan_once() {
+  set +e  # tolerate per-URL parse failures
+  log "scan start url=$URL"
+  local md
+  md=$(futron-scrape "$URL" 2>/dev/null || true)
+  if [[ -z "$md" || ${#md} -lt 200 ]]; then
+    log "scrape returned empty/short"
+    echo "futron-bookmark-watcher: scrape failed (Dewey unreachable or empty)" >&2
+    return 1
+  fi
+  # Extract unique tweet URLs from the markdown
+  local tmp_urls; tmp_urls=$(mktemp)
+  printf '%s' "$md" | grep -oE 'https?://x\.com/[A-Za-z0-9_]+/status/[0-9]+' | sort -u > "$tmp_urls"
+  local total_urls; total_urls=$(wc -l <"$tmp_urls" | tr -d ' ')
+  log "found $total_urls unique URLs"
+
+  # For each URL, parse the surrounding tweet body from the markdown blob
+  local new_count=0
+  while read -r url; do
+    [[ -z "$url" ]] && continue
+    # already seen?
+    if python3 -c "import json,sys; d=json.load(open('$SEEN')); sys.exit(0 if '$url' in d else 1)" 2>/dev/null; then
+      continue
+    fi
+
+    local handle; handle=$(echo "$url" | sed -E 's|.*x.com/([^/]+)/.*|\1|')
+    local id; id=$(echo "$url" | sed -E 's|.*/status/([0-9]+).*|\1|')
+
+    # Pull the tweet body — markdown has body before/after the URL
+    local body
+    body=$(printf '%s' "$md" | grep -B 5 -A 1 -F "$url" 2>/dev/null | head -c 1200)
+
+    # Classify + extract install candidates from the body
+    local repos npms pips installs
+    repos=$(printf '%s' "$body" | grep -oE 'github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' | sort -u | tr '\n' ',' | sed 's/,$//')
+    npms=$(printf '%s' "$body" | grep -oE 'npm i(nstall)?(\s+-g)?\s+[A-Za-z0-9_@/-]+' | head -1)
+    pips=$(printf '%s' "$body" | grep -oE 'pip install\s+[A-Za-z0-9_-]+' | head -1)
+    installs="${repos:+repos=$repos}${npms:+ ; ${npms}}${pips:+ ; ${pips}}"
+
+    # Quick classifier (regex-based — keeps it free; if cascade is wanted, see below)
+    local kind="other"
+    case "$body" in
+      *"MCP server"*|*"mcp server"*|*MCP*) kind="mcp" ;;
+      *"Claude skill"*|*"Claude Skill"*|*skill*) kind="skill" ;;
+      *"npm i"*|*"npm install"*|*"pip install"*) kind="cli-tool" ;;
+      *"Open Source"*|*"open-source"*|*"GitHub"*|*"github.com"*) kind="repo" ;;
+      *"AI model"*|*"LLM"*|*"GGUF"*|*"GPT-OSS"*) kind="model" ;;
+    esac
+
+    # Save full record
+    local date_dir; date_dir="$MEM_DIR/$(date +%Y-%m-%d)"
+    mkdir -p "$date_dir"
+    local outfile; outfile="$date_dir/${handle}-${id}.md"
+    {
+      echo "---"
+      echo "url: $url"
+      echo "handle: $handle"
+      echo "id: $id"
+      echo "kind: $kind"
+      echo "discovered: $(date +%Y-%m-%dT%H:%M:%S)"
+      echo "${repos:+repos: $repos}"
+      echo "---"
+      echo
+      echo "## Body"
+      echo
+      printf '%s\n' "$body"
+      echo
+      [[ -n "$installs" ]] && { echo "## Install candidates"; echo; printf '%s\n' "$installs"; }
+    } > "$outfile"
+
+    # Update SEEN state
+    python3 -c "
+import json
+d = json.load(open('$SEEN'))
+d['$url'] = {
+  'handle': '$handle',
+  'id': '$id',
+  'kind': '$kind',
+  'seen': '$(date +%Y-%m-%dT%H:%M:%S)',
+  'file': '$outfile'
+}
+json.dump(d, open('$SEEN','w'), indent=2)
+"
+
+    # Append to INDEX
+    {
+      echo "- [$handle/$id]($url) — kind=$kind — file=\`$(basename "$outfile")\`"
+    } >> "$MEM_DIR/INDEX.md"
+
+    new_count=$((new_count+1))
+    log "new $kind $url file=$outfile"
+    echo "+ NEW [$kind] @$handle: $url"
+  done < "$tmp_urls"
+  rm -f "$tmp_urls"
+
+  log "scan end new=$new_count total_seen=$(python3 -c "import json; print(len(json.load(open('$SEEN'))))" )"
+  echo "scan complete. new=$new_count"
+
+  # Optional notify
+  if [[ "$NOTIFY" == 1 && "$new_count" -gt 0 ]]; then
+    if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+      curl -sS --max-time 8 \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${TELEGRAM_CHAT_ID}" \
+        -d "text=futron-bookmark-watcher: $new_count new bookmark(s) found" >/dev/null || true
+    fi
+  fi
+
+  # Optional safe-install (only Claude Skills + harmless npm packages)
+  if [[ "$INSTALL_SAFE" == 1 && "$new_count" -gt 0 ]]; then
+    log "safe-install pass"
+    # Iterate the new files added in this run
+    find "$MEM_DIR/$(date +%Y-%m-%d)" -type f -name '*.md' -newer "$STATE_DIR/.last_install_marker" 2>/dev/null | while read -r mdf; do
+      local kind=$(grep -m1 '^kind:' "$mdf" | sed 's/kind: //')
+      local repo=$(grep -m1 '^repos:' "$mdf" | sed 's/repos: //;s/,.*//')
+      [[ -z "$repo" ]] && continue
+      case "$kind" in
+        skill)
+          # Naive Claude Skill install: clone into ~/.claude/skills/<name>
+          local name=$(basename "$repo")
+          [[ -d "${FUTRON_SKILLS_DIR:-$HOME/.claude/skills}/$name" ]] && continue
+          log "install skill: $repo"
+          git clone --quiet --depth=1 "https://$repo" "${FUTRON_SKILLS_DIR:-$HOME/.claude/skills}/$name" 2>>"$LOG" || log "skill clone failed $repo"
+          ;;
+        cli-tool|mcp|repo)
+          # Stage the repo only; never auto-execute install scripts
+          local stage="${FUTRON_SCRAPE_STATE:-$HOME/.config/futron-scrape}/staged/$(basename "$repo")"
+          [[ -d "$stage" ]] && continue
+          log "stage repo: $repo"
+          git clone --quiet --depth=1 "https://$repo" "$stage" 2>>"$LOG" || log "repo clone failed $repo"
+          ;;
+      esac
+    done
+    touch "$STATE_DIR/.last_install_marker"
+  fi
+}
+
+# Continuous-watch loop
+if [[ "$WATCH" != 0 ]]; then
+  log "watch loop start interval=${WATCH}s"
+  while true; do
+    scan_once || log "scan errored, continuing"
+    sleep "$WATCH"
+  done
+else
+  scan_once
+fi

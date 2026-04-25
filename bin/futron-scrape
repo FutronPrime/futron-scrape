@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+# futron-scrape — Universal free / OSS web scraping cascade.
+# https://github.com/<your-org>/futron-scrape  (public sanitized release)
+#
+# Replaces Firecrawl (paid) + WebFetch (billed) with a 9-tier strategy that
+# stops at the first tier returning useful content.
+#
+#   T1 site-specific public APIs (FREE, no auth):
+#       reddit (*.json), hn (algolia), bluesky (public.api.bsky.app),
+#       mastodon (instance api), github (rest), stackexchange (api),
+#       wikipedia (rest), npm/pypi (registry), substack (/feed)
+#   T2 X / Twitter oembed (publish.twitter.com)
+#   T3 YouTube via yt-dlp (title + description + auto-captions)
+#   T4 file-type handlers: PDF (pdftotext), images (tesseract OCR)
+#   T5 r.jina.ai reader (free, JS-aware)
+#   T6 archive proxies: archive.org wayback, archive.is, 12ft.io (--paywall)
+#   T7 raw curl + html-strip
+#   T8 playwright headless (with --browser; needs `pip install playwright`)
+#   T9 futron-cua-fetch — osascript-driven logged-in browser (macOS only)
+#
+# Exit 0 = body printed; 1 = exhausted; 2 = usage; 3 = browser-needed.
+#
+# Optional env:
+#   FUTRON_SCRAPE_TIMEOUT   per-source timeout (default 12)
+#   FUTRON_SCRAPE_LOG       log path (default /tmp/futron-scrape.log)
+#   GITHUB_TOKEN            raises GitHub rate to 5000/hr
+#   FUTRON_SCRAPE_STATE     state dir (default ~/.config/futron-scrape)
+#
+# License: MIT
+
+set -uo pipefail
+
+TIMEOUT="${FUTRON_SCRAPE_TIMEOUT:-12}"
+LOG="${FUTRON_SCRAPE_LOG:-/tmp/futron-scrape.log}"
+STATE_DIR="${FUTRON_SCRAPE_STATE:-$HOME/.config/futron-scrape}"
+MODE="markdown"
+BROWSER_FORCE=0
+ALLOW_PAYWALL=0
+PROBE=0
+URL=""
+
+die()  { echo "futron-scrape: $*" >&2; exit 2; }
+log()  { printf '[%s] %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$*" >>"$LOG" 2>/dev/null || true; }
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --raw)     MODE="raw";   shift ;;
+    --json)    MODE="json";  shift ;;
+    --browser) BROWSER_FORCE=1; shift ;;
+    --paywall) ALLOW_PAYWALL=1; shift ;;
+    --probe)   PROBE=1; shift ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -)  URL="$(cat)"; URL="${URL//[$'\r\n ']/}"; shift ;;
+    --) shift; URL="$1"; break ;;
+    *)  URL="$1"; shift ;;
+  esac
+done
+
+[[ -z "$URL" ]] && die "no URL given"
+log "scrape $URL mode=$MODE"
+
+emit() {
+  local src="$1"; local body="$2"
+  if [[ "$PROBE" == 1 ]]; then
+    printf '%s\t%s\tbytes=%d\n' "$src" "OK" "${#body}"
+    log "probe ok $src bytes=${#body}"
+    exit 0
+  fi
+  if [[ "$MODE" == "json" ]]; then
+    U="$URL" S="$src" B="$body" python3 -c 'import json,os; print(json.dumps({"url":os.environ["U"],"source":os.environ["S"],"status":"ok","length":len(os.environ["B"]),"body":os.environ["B"]}))' 2>/dev/null
+  else
+    printf '%s\n' "$body"
+  fi
+  log "ok $src bytes=${#body}"
+  exit 0
+}
+
+HOST="$(printf '%s' "$URL" | python3 -c 'import sys,urllib.parse as u; print((u.urlparse(sys.stdin.read().strip()).hostname or "").lower())')"
+PATHN="$(printf '%s' "$URL" | python3 -c 'import sys,urllib.parse as u; print(u.urlparse(sys.stdin.read().strip()).path)')"
+
+# =============================================================================
+# T1 — Site-specific public APIs (zero cost, no auth)
+# =============================================================================
+
+try_reddit() {
+  case "$HOST" in *reddit.com) ;; *) return 1 ;; esac
+  local jurl="${URL%/}.json?raw_json=1&limit=100"
+  jurl="${jurl//www.reddit.com/api.reddit.com}"
+  local body; body=$(timeout "$TIMEOUT" curl -sSL --compressed -A "Mozilla/5.0 futron-scrape" "$jurl" 2>/dev/null || true)
+  [[ -z "$body" || ( "${body:0:1}" != "[" && "${body:0:1}" != "{" ) ]] && return 1
+  local txt; txt=$(BODY="$body" python3 -c '
+import json, os
+d = json.loads(os.environ["BODY"])
+out = []
+def render_post(p):
+    pd = p.get("data", {})
+    out.append(f"# {pd.get(\"title\",\"\")}")
+    out.append(f"r/{pd.get(\"subreddit\",\"\")} · u/{pd.get(\"author\",\"\")} · score={pd.get(\"score\",0)}")
+    if pd.get("selftext"): out.append(pd["selftext"])
+    if pd.get("url_overridden_by_dest"): out.append(f"link: {pd[\"url_overridden_by_dest\"]}")
+def render_comment(c, depth=0):
+    cd = c.get("data", {}); body = cd.get("body","")
+    if not body: return
+    ind = "  " * depth
+    out.append(f"{ind}- u/{cd.get(\"author\",\"\")} ({cd.get(\"score\",0)}): {body}")
+    replies = cd.get("replies")
+    if isinstance(replies, dict):
+        for r in replies.get("data",{}).get("children",[]):
+            render_comment(r, depth+1)
+if isinstance(d, list):
+    for child in d[0].get("data",{}).get("children",[]): render_post(child)
+    out.append("\n## Comments\n")
+    for child in d[1].get("data",{}).get("children",[]):
+        if child.get("kind")=="t1": render_comment(child)
+elif isinstance(d, dict) and d.get("data",{}).get("children"):
+    for child in d["data"]["children"]: render_post(child)
+print("\n".join(out))
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 50 ]] && emit "reddit-json" "$txt"
+  return 1
+}
+
+try_hn() {
+  case "$HOST" in news.ycombinator.com) ;; *) return 1 ;; esac
+  local id; id=$(printf '%s' "$URL" | grep -oE 'id=[0-9]+' | head -1 | cut -d= -f2)
+  [[ -z "$id" ]] && return 1
+  local body; body=$(timeout "$TIMEOUT" curl -sSL "https://hn.algolia.com/api/v1/items/$id" 2>/dev/null || true)
+  [[ -z "$body" ]] && return 1
+  local txt; txt=$(BODY="$body" python3 -c '
+import json, os, re, html
+def strip(t): return re.sub(r"<[^>]+>","",html.unescape(t or "")).strip()
+d = json.loads(os.environ["BODY"])
+out = [f"# {d.get(\"title\") or strip(d.get(\"text\",\"\"))[:80]}", f"by {d.get(\"author\",\"?\")} · points={d.get(\"points\",0)}"]
+if d.get("url"): out.append(f"link: {d[\"url\"]}")
+if d.get("text"): out.append(strip(d["text"]))
+def walk(node, depth=0):
+    for c in node.get("children",[]):
+        t = strip(c.get("text",""))
+        if t: out.append(f"{\"  \"*depth}- {c.get(\"author\",\"?\")}: {t}")
+        walk(c, depth+1)
+walk(d)
+print("\n".join(out))
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 30 ]] && emit "hn-algolia" "$txt"
+  return 1
+}
+
+try_bluesky() {
+  case "$HOST" in bsky.app|*.bsky.app|*.bsky.social) ;; *) return 1 ;; esac
+  local did rkey
+  did=$(printf '%s' "$PATHN" | grep -oE '/profile/[^/]+' | head -1 | sed 's|/profile/||')
+  rkey=$(printf '%s' "$PATHN" | grep -oE '/post/[^/]+' | head -1 | sed 's|/post/||')
+  [[ -z "$did" || -z "$rkey" ]] && return 1
+  if [[ "$did" != did:* ]]; then
+    local resolved; resolved=$(timeout 5 curl -sSL "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=$did" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("did",""))' 2>/dev/null)
+    [[ -n "$resolved" ]] && did="$resolved"
+  fi
+  local body; body=$(timeout "$TIMEOUT" curl -sSL "https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?uri=at://$did/app.bsky.feed.post/$rkey" 2>/dev/null || true)
+  [[ -z "$body" ]] && return 1
+  local txt; txt=$(BODY="$body" python3 -c '
+import json, os
+d = json.loads(os.environ["BODY"])
+def render(node, depth=0):
+    out = []
+    p = node.get("post",{})
+    rec = p.get("record",{}); auth = p.get("author",{})
+    ind = "  "*depth
+    out.append(f"{ind}- @{auth.get(\"handle\",\"?\")}: {rec.get(\"text\",\"\")}")
+    for r in node.get("replies",[]) or []: out += render(r, depth+1)
+    return out
+print("\n".join(render(d.get("thread",{}))))
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 20 ]] && emit "bluesky" "$txt"
+  return 1
+}
+
+try_mastodon() {
+  case "$PATHN" in
+    /@*/[0-9]*|*/users/*/statuses/[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  local sid; sid=$(printf '%s' "$PATHN" | grep -oE '[0-9]{8,}' | head -1)
+  [[ -z "$sid" ]] && return 1
+  local body; body=$(timeout "$TIMEOUT" curl -sSL "https://$HOST/api/v1/statuses/$sid" 2>/dev/null || true)
+  [[ -z "$body" || "${body:0:1}" != "{" ]] && return 1
+  local txt; txt=$(BODY="$body" python3 -c '
+import json, os, html, re
+d = json.loads(os.environ["BODY"])
+def strip(t): return re.sub(r"<[^>]+>","",html.unescape(t or "")).strip()
+print(f"# Mastodon post by @{d.get(\"account\",{}).get(\"acct\",\"?\")}")
+print(strip(d.get("content","")))
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 20 ]] && emit "mastodon" "$txt"
+  return 1
+}
+
+try_github() {
+  case "$HOST" in github.com) ;; *) return 1 ;; esac
+  local repo; repo=$(printf '%s' "$PATHN" | grep -oE '^/[^/]+/[^/]+' | head -1 | sed 's|^/||')
+  [[ -z "$repo" ]] && return 1
+  local hdrs=()
+  [[ -n "${GITHUB_TOKEN:-}" ]] && hdrs+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  local kind="readme" body=""
+  if [[ "$PATHN" =~ /issues/([0-9]+) ]]; then
+    body=$(timeout "$TIMEOUT" curl -sSL "${hdrs[@]}" "https://api.github.com/repos/$repo/issues/${BASH_REMATCH[1]}" 2>/dev/null || true); kind="issue"
+  elif [[ "$PATHN" =~ /pull/([0-9]+) ]]; then
+    body=$(timeout "$TIMEOUT" curl -sSL "${hdrs[@]}" "https://api.github.com/repos/$repo/pulls/${BASH_REMATCH[1]}" 2>/dev/null || true); kind="pr"
+  else
+    body=$(timeout "$TIMEOUT" curl -sSL "${hdrs[@]}" "https://api.github.com/repos/$repo/readme" 2>/dev/null || true); kind="readme"
+  fi
+  [[ -z "$body" ]] && return 1
+  local txt; txt=$(BODY="$body" KIND="$kind" REPO="$repo" python3 -c '
+import json, base64, os
+kind = os.environ["KIND"]; repo = os.environ["REPO"]
+d = json.loads(os.environ["BODY"])
+if kind == "readme" and d.get("content"):
+    print(f"# {repo}\n")
+    print(base64.b64decode(d["content"]).decode("utf-8","replace"))
+elif kind in ("issue","pr"):
+    print(f"# {kind.upper()} #{d.get(\"number\")} — {d.get(\"title\",\"\")}")
+    print(f"by @{d.get(\"user\",{}).get(\"login\",\"?\")} · state={d.get(\"state\",\"?\")}")
+    if d.get("body"): print("\n" + d["body"])
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 30 ]] && emit "github-api" "$txt"
+  return 1
+}
+
+try_stackoverflow() {
+  case "$HOST" in stackoverflow.com|*.stackoverflow.com|stackexchange.com|*.stackexchange.com|serverfault.com|superuser.com) ;; *) return 1 ;; esac
+  local site="${HOST%%.*}"
+  [[ "$HOST" == stackoverflow.com ]] && site="stackoverflow"
+  local qid; qid=$(printf '%s' "$PATHN" | grep -oE '/questions/[0-9]+' | head -1 | sed 's|/questions/||')
+  [[ -z "$qid" ]] && return 1
+  local body; body=$(timeout "$TIMEOUT" curl -sSL --compressed "https://api.stackexchange.com/2.3/questions/$qid?site=$site&filter=withbody" 2>/dev/null || true)
+  local body_a; body_a=$(timeout "$TIMEOUT" curl -sSL --compressed "https://api.stackexchange.com/2.3/questions/$qid/answers?site=$site&filter=withbody&sort=votes" 2>/dev/null || true)
+  [[ -z "$body" ]] && return 1
+  local txt; txt=$(BODY="$body" BODY_A="$body_a" python3 -c '
+import json, os, html, re
+def strip(t): return re.sub(r"<[^>]+>","",html.unescape(t or "")).strip()
+q = json.loads(os.environ["BODY"]).get("items",[{}])[0]
+print(f"# {q.get(\"title\",\"\")}")
+print(strip(q.get("body","")))
+ans = json.loads(os.environ.get("BODY_A","{}")).get("items",[])
+for a in ans[:5]:
+    print(f"\n## Answer ({a.get(\"score\",0)} votes, accepted={a.get(\"is_accepted\",False)})")
+    print(strip(a.get("body","")))
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 30 ]] && emit "stackexchange" "$txt"
+  return 1
+}
+
+try_wikipedia() {
+  case "$HOST" in *.wikipedia.org) ;; *) return 1 ;; esac
+  local title; title=$(printf '%s' "$PATHN" | sed 's|^/wiki/||;s|^/||')
+  [[ -z "$title" ]] && return 1
+  local body; body=$(timeout "$TIMEOUT" curl -sSL "https://${HOST}/api/rest_v1/page/summary/$title" 2>/dev/null || true)
+  local extract; extract=$(BODY="$body" python3 -c 'import json,os; print(json.loads(os.environ["BODY"]).get("extract",""))' 2>/dev/null || true)
+  [[ -n "$extract" ]] && emit "wikipedia" "# $title
+
+$extract"
+  return 1
+}
+
+try_npm() {
+  case "$HOST" in npmjs.com|*.npmjs.com) ;; *) return 1 ;; esac
+  local pkg; pkg=$(printf '%s' "$PATHN" | sed 's|^/package/||;s|^/||')
+  [[ -z "$pkg" ]] && return 1
+  local body; body=$(timeout "$TIMEOUT" curl -sSL "https://registry.npmjs.org/$pkg" 2>/dev/null || true)
+  local txt; txt=$(BODY="$body" python3 -c '
+import json, os
+d = json.loads(os.environ["BODY"])
+print(f"# {d.get(\"name\",\"?\")} v{d.get(\"dist-tags\",{}).get(\"latest\",\"?\")}")
+print(d.get("description",""))
+print("\nREADME:\n")
+print((d.get("readme","") or "")[:8000])
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 30 ]] && emit "npm-registry" "$txt"
+  return 1
+}
+
+try_pypi() {
+  case "$HOST" in pypi.org|*.pypi.org) ;; *) return 1 ;; esac
+  local pkg; pkg=$(printf '%s' "$PATHN" | sed 's|^/project/||;s|/$||;s|^/||')
+  [[ -z "$pkg" ]] && return 1
+  local body; body=$(timeout "$TIMEOUT" curl -sSL "https://pypi.org/pypi/$pkg/json" 2>/dev/null || true)
+  local txt; txt=$(BODY="$body" python3 -c '
+import json, os
+d = json.loads(os.environ["BODY"])
+i = d.get("info",{})
+print(f"# {i.get(\"name\",\"?\")} v{i.get(\"version\",\"?\")}")
+print(i.get("summary",""))
+print("\n" + (i.get("description","") or "")[:8000])
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 30 ]] && emit "pypi" "$txt"
+  return 1
+}
+
+try_substack() {
+  case "$HOST" in *substack.com|*.substack.com) ;; *) return 1 ;; esac
+  local slug; slug=$(printf '%s' "$PATHN" | grep -oE '/p/[^/?]+' | head -1 | sed 's|/p/||')
+  if [[ -z "$slug" ]]; then
+    local rss; rss=$(timeout "$TIMEOUT" curl -sSL "https://${HOST}/feed" 2>/dev/null || true)
+    [[ -n "$rss" && "${#rss}" -gt 200 ]] && emit "substack-rss" "$rss"
+    return 1
+  fi
+  local body; body=$(timeout "$TIMEOUT" curl -sSL "https://${HOST}/api/v1/posts/$slug" 2>/dev/null || true)
+  local txt; txt=$(BODY="$body" python3 -c '
+import json, os, html, re
+def strip(t): return re.sub(r"<[^>]+>","",html.unescape(t or "")).strip()
+d = json.loads(os.environ["BODY"])
+print(f"# {d.get(\"title\",\"\")}")
+print(strip(d.get("body_html") or d.get("description","")))
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 50 ]] && emit "substack-api" "$txt"
+  return 1
+}
+
+# =============================================================================
+# T2 — X / Twitter oembed
+# =============================================================================
+try_oembed() {
+  case "$HOST" in x.com|*.x.com|twitter.com|*.twitter.com|mobile.twitter.com) ;; *) return 1 ;; esac
+  local enc body
+  enc=$(python3 -c 'import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=""))' "$URL")
+  body=$(timeout "$TIMEOUT" curl -sSL "https://publish.twitter.com/oembed?url=$enc&omit_script=true" 2>/dev/null || true)
+  [[ -z "$body" || "$body" != *"\"html\""* ]] && return 1
+  local txt; txt=$(BODY="$body" python3 -c '
+import json, os, re, html
+d = json.loads(os.environ["BODY"])
+hh = re.sub(r"<br\s*/?>", "\n", d.get("html",""))
+hh = re.sub(r"<[^>]+>", "", hh)
+print(f"# Tweet by {d.get(\"author_name\",\"?\")}\n{d.get(\"url\",\"\")}\n\n{html.unescape(hh).strip()}")
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 30 ]] && emit "oembed" "$txt"
+  return 1
+}
+
+# =============================================================================
+# T3 — YouTube via yt-dlp
+# =============================================================================
+try_ytdlp() {
+  case "$HOST" in youtube.com|*.youtube.com|youtu.be|*.youtu.be) ;; *) return 1 ;; esac
+  command -v yt-dlp >/dev/null 2>&1 || { log "yt-dlp missing"; return 1; }
+  local title desc subs td
+  title=$(timeout "$TIMEOUT" yt-dlp --print "%(title)s" "$URL" 2>/dev/null || true)
+  desc=$(timeout "$TIMEOUT" yt-dlp --print "%(description)s" "$URL" 2>/dev/null || true)
+  td=$(mktemp -d)
+  timeout 30 yt-dlp --skip-download --write-auto-sub --sub-format vtt --sub-lang en -o "$td/%(id)s" "$URL" >/dev/null 2>&1 || true
+  subs=$(cat "$td"/*.vtt 2>/dev/null | sed -E '/^WEBVTT|^[0-9]+:[0-9]+|^$/d' | head -c 8000)
+  rm -rf "$td"
+  if [[ -n "$title$desc$subs" ]]; then
+    local out="$title"
+    [[ -n "$desc" ]] && out+="
+
+## Description
+$desc"
+    [[ -n "$subs" ]] && out+="
+
+## Transcript (auto-captions)
+$subs"
+    emit "yt-dlp" "$out"
+  fi
+  return 1
+}
+
+# =============================================================================
+# T4 — file-type handlers (PDFs, images via OCR)
+# =============================================================================
+try_pdf() {
+  case "$URL" in *.pdf|*.PDF|*.pdf?*|*.PDF?*) ;; *) return 1 ;; esac
+  command -v pdftotext >/dev/null 2>&1 || { log "pdftotext missing (brew install poppler)"; return 1; }
+  local td; td=$(mktemp -d); local pdf="$td/in.pdf"
+  timeout "$TIMEOUT" curl -sSL -o "$pdf" "$URL" 2>/dev/null || { rm -rf "$td"; return 1; }
+  [[ -s "$pdf" ]] || { rm -rf "$td"; return 1; }
+  local txt; txt=$(pdftotext -layout "$pdf" - 2>/dev/null | head -c 200000)
+  rm -rf "$td"
+  [[ -n "$txt" && "${#txt}" -gt 100 ]] && emit "pdftotext" "$txt"
+  return 1
+}
+
+try_image_ocr() {
+  case "$URL" in *.png|*.PNG|*.jpg|*.JPG|*.jpeg|*.JPEG|*.webp|*.WEBP|*.tif|*.tiff) ;; *) return 1 ;; esac
+  command -v tesseract >/dev/null 2>&1 || { log "tesseract missing (brew install tesseract)"; return 1; }
+  local td; td=$(mktemp -d); local img="$td/in.img"
+  timeout "$TIMEOUT" curl -sSL -o "$img" "$URL" 2>/dev/null || { rm -rf "$td"; return 1; }
+  [[ -s "$img" ]] || { rm -rf "$td"; return 1; }
+  local txt; txt=$(tesseract "$img" - 2>/dev/null | head -c 100000)
+  rm -rf "$td"
+  [[ -n "$txt" && "${#txt}" -gt 50 ]] && emit "tesseract-ocr" "$txt"
+  return 1
+}
+
+# =============================================================================
+# T5 — r.jina.ai reader
+# =============================================================================
+try_jina() {
+  local body; body=$(timeout "$TIMEOUT" curl -sSL --compressed -H "Accept: text/markdown" "https://r.jina.ai/$URL" 2>/dev/null || true)
+  [[ -n "$body" && "${#body}" -gt 80 ]] && emit "jina" "$body"
+  return 1
+}
+
+# =============================================================================
+# T6 — archive proxies (paywall / dead-page recovery)
+# =============================================================================
+try_wayback() {
+  local api="https://archive.org/wayback/available?url=$(python3 -c 'import sys,urllib.parse as u; print(u.quote(sys.argv[1],safe=""))' "$URL")"
+  local snap; snap=$(timeout "$TIMEOUT" curl -sSL "$api" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("archived_snapshots",{}).get("closest",{}).get("url",""))' 2>/dev/null || true)
+  [[ -z "$snap" ]] && return 1
+  local body; body=$(timeout "$TIMEOUT" curl -sSL --compressed -H "Accept: text/markdown" "https://r.jina.ai/$snap" 2>/dev/null || true)
+  [[ -n "$body" && "${#body}" -gt 100 ]] && emit "wayback+jina" "$body"
+  return 1
+}
+
+try_archive_is() {
+  local arch="https://archive.is/newest/$URL"
+  local body; body=$(timeout "$TIMEOUT" curl -sSL --compressed -H "Accept: text/markdown" "https://r.jina.ai/$arch" 2>/dev/null || true)
+  [[ -n "$body" && "${#body}" -gt 100 ]] && emit "archive.is+jina" "$body"
+  return 1
+}
+
+try_12ft() {
+  [[ "$ALLOW_PAYWALL" == 1 ]] || return 1
+  local body; body=$(timeout "$TIMEOUT" curl -sSL --compressed -H "Accept: text/markdown" "https://r.jina.ai/https://12ft.io/$URL" 2>/dev/null || true)
+  [[ -n "$body" && "${#body}" -gt 100 ]] && emit "12ft+jina" "$body"
+  return 1
+}
+
+# =============================================================================
+# T7 — raw curl fallback
+# =============================================================================
+try_curl() {
+  local body; body=$(timeout "$TIMEOUT" curl -sSL --compressed -A "Mozilla/5.0 (Macintosh) futron-scrape/2.0" "$URL" 2>/dev/null || true)
+  [[ -n "$body" && "${#body}" -gt 80 ]] || return 1
+  if [[ "$MODE" == "raw" ]]; then emit "curl-raw" "$body"; fi
+  local txt; txt=$(BODY="$body" python3 -c '
+import os, re, html
+h = os.environ["BODY"]
+h = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", "", h)
+h = re.sub(r"(?i)<(p|div|br|li|h[1-6]|article|section)[^>]*>", "\n", h)
+h = re.sub(r"<[^>]+>", "", h)
+h = html.unescape(h)
+h = re.sub(r"\n{3,}", "\n\n", h).strip()
+print(h)
+' 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 80 ]] && emit "curl" "$txt"
+  return 1
+}
+
+# =============================================================================
+# T8 — Playwright headless (last-resort JS-rendering, no auth)
+# =============================================================================
+try_playwright() {
+  python3 -c 'import playwright' 2>/dev/null || { log "playwright missing"; return 1; }
+  local txt
+  txt=$(timeout 30 python3 - "$URL" <<'PY' 2>/dev/null || true
+import sys, asyncio
+from playwright.async_api import async_playwright
+async def go():
+    async with async_playwright() as p:
+        b = await p.chromium.launch(headless=True)
+        ctx = await b.new_context(user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+        page = await ctx.new_page()
+        await page.goto(sys.argv[1], wait_until="networkidle", timeout=20000)
+        try:
+            txt = await page.evaluate("() => document.body.innerText")
+        except Exception:
+            txt = ""
+        await b.close()
+        print(txt)
+asyncio.run(go())
+PY
+)
+  [[ -n "$txt" && "${#txt}" -gt 100 ]] && emit "playwright" "$txt"
+  return 1
+}
+
+# =============================================================================
+# T9 — futron-cua-fetch (osascript-driven logged-in browser; macOS only)
+# =============================================================================
+try_cua() {
+  command -v futron-cua-fetch >/dev/null 2>&1 || return 1
+  [[ "$(uname)" == "Darwin" ]] || return 1
+  pgrep -x WindowServer >/dev/null 2>&1 || return 1
+  local txt; txt=$(timeout 45 futron-cua-fetch "$URL" 2>/dev/null || true)
+  [[ -n "$txt" && "${#txt}" -gt 80 ]] && emit "cua-osascript" "$txt"
+  return 1
+}
+
+# =============================================================================
+# Cascade execution
+# =============================================================================
+
+if [[ "$BROWSER_FORCE" == 1 ]]; then
+  try_playwright || true
+  echo "futron-scrape: playwright tier failed (install: pip install playwright && playwright install chromium)" >&2
+  exit 1
+fi
+
+[[ "$MODE" != raw ]] && {
+  try_reddit       || true
+  try_hn           || true
+  try_bluesky      || true
+  try_mastodon     || true
+  try_github       || true
+  try_stackoverflow|| true
+  try_wikipedia    || true
+  try_npm          || true
+  try_pypi         || true
+  try_substack     || true
+}
+try_oembed         || true
+try_ytdlp          || true
+try_pdf            || true
+try_image_ocr      || true
+try_jina           || true
+try_wayback        || true
+try_archive_is     || true
+try_12ft           || true
+try_curl           || true
+try_playwright     || true
+try_cua            || true
+
+log "exhausted $URL"
+echo "futron-scrape: all OSS sources exhausted for $URL" >&2
+echo "   Options:" >&2
+echo "     · futron-scrape --browser <url>   (force Playwright headless)" >&2
+echo "     · futron-scrape --paywall <url>   (try 12ft.io for paywalls)" >&2
+echo "     · For login walls, use a logged-in browser MCP tool (claude_in_chrome / playwright_mcp / computer-use) — your agent can pick this up via the queue file." >&2
+HASH=$(printf '%s' "$URL" | shasum 2>/dev/null | cut -d' ' -f1 | head -c 12)
+QFILE="$STATE_DIR/scrape-requests/${HASH:-pending}.json"
+mkdir -p "$STATE_DIR/scrape-requests"
+U="$URL" M="$MODE" R="$QFILE" python3 -c '
+import json, os, time
+json.dump({"url": os.environ["U"], "mode": os.environ["M"], "created": time.time(), "status": "pending", "hint": "all OSS tiers exhausted; needs logged-in browser"}, open(os.environ["R"],"w"), indent=2)
+' 2>/dev/null
+echo "   queued: $QFILE" >&2
+exit 3

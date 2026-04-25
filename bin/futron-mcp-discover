@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# futron-mcp-discover — Find open-source MCP servers / OSS clients for "trouble" sites
+# (login-walled, JS-heavy, fingerprinting, paywalled). Searches a curated registry
+# plus npm + GitHub + PyPI in parallel and returns ranked options. Optional --install
+# clones safe candidates into ~/.openclaw/integrations/staged/<repo> for review
+# (NEVER auto-runs install scripts).
+#
+# Usage:
+#   futron-mcp-discover linkedin            # ranked list of LinkedIn options
+#   futron-mcp-discover reddit --install    # also stage the safest match
+#   futron-mcp-discover --list              # show curated trouble-site map
+#   futron-mcp-discover --json reddit       # JSON output
+#
+# Curated map biased toward FUTRON's needs (Rule 26: free + local + uncensored).
+#
+set -uo pipefail
+
+LOG="${FUTRON_MCP_DISCOVER_LOG:-/tmp/futron-mcp-discover.log}"
+MODE="text"
+INSTALL=0
+TARGET=""
+
+# Source FUTRON creds so live searches use authenticated rate limits
+
+# Curated map of well-known open-source MCP servers / OSS clients per "trouble site".
+# Format: "topic|recommendation|notes"
+read -r -d '' CURATED <<'EOF' || true
+reddit|futron-scrape native (.json + RSS + Pullpush). For OAuth: PRAW (Python) with REDDIT_CLIENT_ID/SECRET.|Read works without auth.
+discord|barnaby-coles/discord-mcp; v0/discord-mcp.|Needs DISCORD_BOT_TOKEN.
+github|futron-scrape native (uses GITHUB_TOKEN if set).|10/min unauth, 5000/hr with token.
+twitter-x|xdevplatform/xmcp (official X MCP server, OAuth1).|See https://github.com/xdevplatform/xmcp.git
+telegram|python-telegram-bot, telegraf (Node), or telegram-bot-mcp.|Needs TELEGRAM_BOT_TOKEN.
+linkedin|tomquirk/linkedin-api (Python, unofficial); stickerdaniel/linkedin-mcp-server.|ToS risk; use sparingly.
+threads|junhoyeo/threads-api (Node) — unofficial, breaks often.|No public API.
+bluesky|@atproto/api (official) + futron-scrape native public.api.bsky.app.|Reads work without auth.
+mastodon|Native /api/v1 — already in futron-scrape T1.|Public posts only without auth.
+slack|smithery-ai/mcp-slack; modelcontextprotocol/servers/slack.|Needs SLACK_BOT_TOKEN.
+notion|makenotion/notion-mcp-server (official); suekou/mcp-notion-server.|Needs NOTION_TOKEN.
+google-docs|modelcontextprotocol/servers/gdrive (official).|OAuth required.
+gmail|GongRzhe/Gmail-MCP-Server.|OAuth required.
+spotify|smithery-ai/mcp-spotify; varunneal/spotify-mcp.|Free Spotify dev app + OAuth.
+youtube|futron-scrape yt-dlp tier covers public videos + transcripts.|For comments: youtube-data-api MCP.
+paywall|futron-scrape --paywall (12ft.io); archive.is fallback.|Ethics call.
+cloudflare-block|playwright-stealth + residential proxy; Bright Data MCP (paid).|Last resort.
+fingerprint|undetected-chromedriver + custom UA. browser-use/browser-use also helps.|Combine with playwright tier.
+captcha|2captcha-mcp; capmonster.cloud (paid).|Many CAPTCHAs are now bot-only.
+whatsapp|kreneskyp/whatsapp-mcp (unofficial, risky).|WhatsApp Business API is proper path.
+EOF
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) MODE="json"; shift ;;
+    --install) INSTALL=1; shift ;;
+    --list) MODE="list"; shift ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    *) TARGET="$1"; shift ;;
+  esac
+done
+
+log() { printf '[%s] %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$*" >>"$LOG" 2>/dev/null || true; }
+
+if [[ "$MODE" == "list" ]]; then
+  printf '%-22s %s\n' "TOPIC" "RECOMMENDATION"
+  printf '%-22s %s\n' "----" "--------------"
+  printf '%s\n' "$CURATED" | while IFS='|' read -r topic rec notes; do
+    [[ -z "$topic" ]] && continue
+    printf '%-22s %s\n' "$topic" "$rec"
+  done
+  exit 0
+fi
+
+[[ -z "$TARGET" ]] && { echo "futron-mcp-discover: target required (e.g. linkedin, reddit, slack). --list for all." >&2; exit 2; }
+
+log "discover target=$TARGET install=$INSTALL"
+
+# 1. curated entry
+CURATED_LINE=$(printf '%s\n' "$CURATED" | grep -i "^$TARGET|" | head -1 || true)
+
+# 2. live search: GitHub, npm, PyPI in parallel (best-effort, free)
+# Use authenticated GitHub if GITHUB_TOKEN is available (5000 req/hr vs 10/min)
+GH_AUTH=()
+[[ -n "${GITHUB_TOKEN:-}" ]] && GH_AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN")
+GH_RAW=$(timeout 10 curl -sSL "${GH_AUTH[@]}" "https://api.github.com/search/repositories?q=$TARGET+mcp+server&per_page=5&sort=stars" 2>/dev/null || true)
+GH_HITS=$(GH_DATA="$GH_RAW" python3 <<'PY' 2>/dev/null || true
+import json, os
+try:
+    d = json.loads(os.environ.get("GH_DATA", "{}"))
+except Exception:
+    raise SystemExit(0)
+for r in d.get("items", [])[:5]:
+    name = r.get("full_name", "?")
+    stars = r.get("stargazers_count", 0)
+    desc = (r.get("description") or "")[:80]
+    print(f"  {stars:>5} stars  {name} — {desc}")
+PY
+)
+
+NPM_RAW=$(timeout 8 curl -sSL "https://registry.npmjs.org/-/v1/search?text=$TARGET+mcp&size=5" 2>/dev/null || true)
+NPM_HITS=$(NPM_DATA="$NPM_RAW" python3 <<'PY' 2>/dev/null || true
+import json, os
+try:
+    d = json.loads(os.environ.get("NPM_DATA", "{}"))
+except Exception:
+    raise SystemExit(0)
+for o in d.get("objects", [])[:5]:
+    p = o.get("package", {})
+    name = p.get("name", "?")
+    ver = p.get("version", "?")
+    desc = (p.get("description") or "")[:80]
+    print(f"  npm  {name} v{ver} — {desc}")
+PY
+)
+
+PYPI_HITS=$(timeout 8 curl -sSL "https://pypi.org/search/?q=$TARGET+mcp" 2>/dev/null \
+  | grep -oE 'package-snippet__name">[^<]+' | sed 's|package-snippet__name">||' | head -5 \
+  | awk '{ printf "  pypi %s\n", $0 }' || true)
+
+if [[ "$MODE" == "json" ]]; then
+  python3 -c '
+import json, os, sys
+print(json.dumps({
+  "target": os.environ["T"],
+  "curated": os.environ.get("C",""),
+  "github": os.environ.get("G",""),
+  "npm": os.environ.get("N",""),
+  "pypi": os.environ.get("P",""),
+}, indent=2))
+'   T="$TARGET" C="$CURATED_LINE" G="$GH_HITS" N="$NPM_HITS" P="$PYPI_HITS"
+  exit 0
+fi
+
+echo "=== futron-mcp-discover: $TARGET ==="
+[[ -n "$CURATED_LINE" ]] && {
+  echo ""
+  echo "Curated FUTRON recommendation:"
+  echo "  $(printf '%s' "$CURATED_LINE" | cut -d'|' -f2)"
+  notes=$(printf '%s' "$CURATED_LINE" | cut -d'|' -f3)
+  [[ -n "$notes" ]] && echo "  ($notes)"
+}
+echo ""
+echo "Top GitHub repos (sorted by stars):"
+[[ -n "$GH_HITS" ]] && echo "$GH_HITS" || echo "  (none)"
+echo ""
+echo "Top npm packages:"
+[[ -n "$NPM_HITS" ]] && echo "$NPM_HITS" || echo "  (none)"
+echo ""
+echo "Top PyPI packages:"
+[[ -n "$PYPI_HITS" ]] && echo "$PYPI_HITS" || echo "  (none)"
+
+# Optional staged install of the #1 GitHub hit (NEVER auto-runs install scripts)
+if [[ "$INSTALL" == 1 ]]; then
+  TOP=$(printf '%s' "$GH_HITS" | head -1 | awk '{print $2}')
+  if [[ -n "$TOP" ]]; then
+    DEST="${FUTRON_SCRAPE_STATE:-$HOME/.config/futron-scrape}/staged/$(basename "$TOP")"
+    if [[ -d "$DEST" ]]; then
+      echo ""
+      echo "Already staged: $DEST"
+    else
+      mkdir -p "$(dirname "$DEST")"
+      git clone --depth=1 "https://github.com/$TOP.git" "$DEST" 2>&1 | tail -5
+      echo ""
+      echo "Staged at: $DEST"
+      echo "Inspect README first; do NOT run install scripts blindly."
+    fi
+  else
+    echo ""
+    echo "No GitHub hit to install."
+  fi
+fi

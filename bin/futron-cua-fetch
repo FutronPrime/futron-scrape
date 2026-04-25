@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# futron-cua-fetch — Drive the user's logged-in browser via macOS osascript / CUA.
+# Used as the last-resort tier in futron-scrape when login walls or fingerprinting
+# block every other path.
+#
+# Strategy (in order):
+#   1. osascript → Google Chrome (active session, all cookies). Best for web SPAs.
+#   2. osascript → Safari (fallback).
+#   3. Emit a request file at ~/.openclaw/state/scrape-requests/<hash>.json so an
+#      agent with claude_in_chrome / playwright / computer-use MCP can take over.
+#
+# Usage:
+#   futron-cua-fetch <url>                  # markdown body
+#   futron-cua-fetch --raw <url>            # raw HTML (innerHTML)
+#   futron-cua-fetch --queue <url>          # write request file only, agent picks up
+#   futron-cua-fetch --browser chrome|safari <url>
+#
+# Notes:
+#   * Chrome must be running and logged-in for auth-walled URLs.
+#   * Cancel with Esc; it leaves the tab open so you can inspect.
+#
+set -uo pipefail
+
+BROWSER="auto"
+QUEUE_ONLY=0
+MODE="markdown"
+URL=""
+
+die() { echo "futron-cua-fetch: $*" >&2; exit 2; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --raw) MODE="raw"; shift ;;
+    --queue) QUEUE_ONLY=1; shift ;;
+    --browser) BROWSER="$2"; shift 2 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    *) URL="$1"; shift ;;
+  esac
+done
+
+[[ -z "$URL" ]] && die "URL required"
+[[ "$URL" =~ ^https?:// ]] || die "URL must start with http(s)://"
+
+QDIR="${FUTRON_SCRAPE_STATE:-$HOME/.config/futron-scrape}/scrape-requests"
+mkdir -p "$QDIR"
+
+if [[ "$QUEUE_ONLY" == 1 ]]; then
+  HASH=$(printf '%s' "$URL" | shasum | cut -d' ' -f1 | head -c 12)
+  REQ="$QDIR/${HASH}.json"
+  U="$URL" M="$MODE" R="$REQ" python3 -c "
+import json, os, time
+json.dump({'url': os.environ['U'], 'mode': os.environ['M'], 'created': time.time(), 'status':'pending', 'hint': 'fetch via claude_in_chrome MCP / playwright_mcp / computer-use MCP'}, open(os.environ['R'],'w'), indent=2)
+"
+  echo "queued: $REQ"
+  exit 0
+fi
+
+drive_chrome() {
+  # Make sure Chrome is running. If not, launch it.
+  if ! pgrep -f "Google Chrome" >/dev/null 2>&1; then
+    open -ga "Google Chrome" 2>/dev/null || return 1
+    sleep 2
+  fi
+  local script
+  if [[ "$MODE" == "raw" ]]; then
+    script='document.documentElement.outerHTML'
+  else
+    script='document.body.innerText'
+  fi
+  # Open URL in a new tab, wait for load, capture content
+  /usr/bin/osascript - "$URL" "$script" <<'OSA' 2>/dev/null
+on run argv
+    set theURL to item 1 of argv
+    set theScript to item 2 of argv
+    tell application "Google Chrome"
+        activate
+        set newTab to make new tab at end of tabs of front window with properties {URL:theURL}
+        delay 4
+        repeat with i from 1 to 8
+            try
+                set loading to loading of newTab
+                if not loading then exit repeat
+            end try
+            delay 1
+        end repeat
+        delay 1
+        try
+            set theResult to (execute newTab javascript theScript)
+            close newTab
+            return theResult
+        on error errMsg
+            close newTab
+            error errMsg
+        end try
+    end tell
+end run
+OSA
+}
+
+drive_safari() {
+  if ! pgrep -f "Safari" >/dev/null 2>&1; then
+    open -ga "Safari" 2>/dev/null || return 1
+    sleep 2
+  fi
+  local script
+  if [[ "$MODE" == "raw" ]]; then script='document.documentElement.outerHTML'
+  else script='document.body.innerText'; fi
+  /usr/bin/osascript - "$URL" "$script" <<'OSA' 2>/dev/null
+on run argv
+    set theURL to item 1 of argv
+    set theScript to item 2 of argv
+    tell application "Safari"
+        activate
+        tell front window
+            set current tab to (make new tab with properties {URL:theURL})
+        end tell
+        delay 5
+        try
+            set theResult to do JavaScript theScript in current tab of front window
+            close current tab of front window
+            return theResult
+        on error errMsg
+            error errMsg
+        end try
+    end tell
+end run
+OSA
+}
+
+case "$BROWSER" in
+  chrome) drive_chrome ;;
+  safari) drive_safari ;;
+  auto)
+    out=$(drive_chrome 2>/dev/null || true)
+    [[ -n "$out" && "${#out}" -gt 50 ]] && { printf '%s\n' "$out"; exit 0; }
+    out=$(drive_safari 2>/dev/null || true)
+    [[ -n "$out" && "${#out}" -gt 50 ]] && { printf '%s\n' "$out"; exit 0; }
+    # Final: queue for agent pickup
+    echo "futron-cua-fetch: osascript paths returned empty; queuing for agent escalation" >&2
+    HASH=$(printf '%s' "$URL" | shasum | cut -d' ' -f1 | head -c 12)
+    REQ="$QDIR/${HASH}.json"
+    U="$URL" M="$MODE" R="$REQ" python3 -c "
+import json, os, time
+json.dump({'url': os.environ['U'], 'mode': os.environ['M'], 'created': time.time(), 'status':'pending', 'hint': 'osascript failed — escalate to claude_in_chrome / computer-use / playwright MCP'}, open(os.environ['R'],'w'), indent=2)
+"
+    echo "queued: $REQ" >&2
+    exit 3
+    ;;
+  *) die "unknown browser: $BROWSER" ;;
+esac
